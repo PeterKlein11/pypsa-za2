@@ -246,7 +246,7 @@ def load_extendable_parameters(n, scenario_setup, snakemake):
     #param.loc[("capital_cost","battery"), :] = param.loc[("capital_cost","battery inverter"),:]
     #param.loc[("capital_cost","battery"), param_yr] += max_hours["battery"]*param.loc[("capital_cost", "battery storage"), param_yr]
     
-    return param
+    return param.rename({"min_stable_level":"p_min_pu"})
 
 # def update_transmission_costs(n, costs, length_factor=1.0, simple_hvdc_costs=False):
 #     # Currently only average transmission costs are implemented
@@ -347,7 +347,8 @@ def init_pu_profiles(gens, snapshots):
             [["max", "min"], snapshots], 
             names=["profile", "snapshots"]
             ), 
-        columns = gens.index
+        columns = gens.index,
+        dtype=float,
     )
     pu_profiles.loc["max"] = 1 
     pu_profiles.loc["min"] = 0
@@ -362,15 +363,19 @@ def extend_reference_data(n, ref_data, snapshots):
 
     ext_years = snapshots.year.unique()
     if len(ref_data.shape) > 1:
-        extended_data = pd.DataFrame(0, index=snapshots, columns=ref_data.columns)
+        extended_data = pd.DataFrame(0, index=snapshots, columns=ref_data.columns, dtype = float)
     else:
         extended_data = pd.Series(0, index=snapshots)     
     ref_years = ref_data.index.year.unique()
 
-    for _ in range(int(np.ceil(len(ext_years) / len(ref_years)))-1):
-        ref_data = pd.concat([ref_data, ref_data],axis=0)
+    #for _ in range(int(np.ceil(len(ext_years) / len(ref_years)))-1):
+    #    ref_data = pd.concat([ref_data, ref_data],axis=0)
 
-    extended_data.iloc[:] = ref_data.iloc[range(len(extended_data))].values
+    num_repeats = int(np.ceil(len(ext_years) / len(ref_years)))
+    ref_data_replicated = pd.concat([ref_data] * num_repeats, axis=0).reset_index(drop=True)
+    ref_data_replicated = ref_data_replicated.iloc[:len(ext_years)*8760]
+
+    extended_data.iloc[:] = ref_data_replicated.iloc[range(len(extended_data))].values
 
     return extended_data.clip(lower=0., upper=1.)
 
@@ -390,7 +395,7 @@ def get_eaf_profiles(snapshots, type):
         out_df.index = range(1,54)
         std_dev = outages.loc[(_type, "std_dev_noise"),:]
 
-        eaf_hrly = out_df.loc[snapshots.week]
+        eaf_hrly = out_df.loc[snapshots.isocalendar().week]
         eaf_hrly.index = snapshots
 
         for col in eaf_hrly.columns:
@@ -476,7 +481,7 @@ def generate_eskom_re_profiles(n, carriers):
     )
 
     eskom_data = remove_leap_day(eskom_data)
-    eskom_profiles = pd.DataFrame(0, index=n.snapshots, columns=carriers)
+    eskom_profiles = pd.DataFrame(0, index=n.snapshots, columns=carriers, dtype=float)
 
     for carrier in carriers:
         weather_years = ref_years[carrier].copy()
@@ -573,7 +578,7 @@ def generate_rmippp_profiles(gens, pu_profiles):
 
 def group_pu_profiles(pu_profiles, component_df):
     years = pu_profiles.index.get_level_values(1).year.unique()
-    p_nom_pu = pd.DataFrame(1, index = pu_profiles.loc["max"].index, columns = [])
+    p_nom_pu = pd.DataFrame(1, index = pu_profiles.loc["max"].index, columns = [], dtype=float)
     pu_mul_p_nom = pu_profiles * component_df["p_nom"]
 
     filtered_df = component_df[component_df["apply_grouping"]].copy().fillna(0)
@@ -615,6 +620,8 @@ def load_fixed_components(carriers, start_year, config, tech_flag):
         A DataFrame containing the loaded components.
     """
 
+
+    
     component_file = os.path.join(scenario_setup["sub_path"], "fixed_technologies.xlsx")
     if tech_flag == "Generator":
         conv_tech = read_and_filter_generators(component_file, "conventional", scenario_setup["fixed_conventional"], carriers)
@@ -629,6 +636,12 @@ def load_fixed_components(carriers, start_year, config, tech_flag):
 
         tech= pd.concat([conv_tech, re_tech])
 
+        if MODEL_TYPE == "capacity":
+            committable_carriers = config["conventional_generators"]["linearised_unit_committment_in_capacity_expansion"]
+            if committable_carriers != False:
+                tech.loc[~tech["carrier"].isin(committable_carriers), "Min Stable Level (%)"] = 0
+            else:
+                tech["Min Stable Level (%)"] = 0
     else:
         tech = read_and_filter_generators(component_file, "storage", scenario_setup["fixed_storage"], carriers)
         tech["apply_grouping"] = config["storage"]["apply_grouping"]
@@ -680,7 +693,7 @@ def group_components(component_df, attrs):
     """
     
     params = ["bus", "carrier", "lifetime", "build_year", "p_nom", "efficiency", "ramp_limit_up", "ramp_limit_down", "marginal_cost", "capital_cost"]
-    uc_params = ["ramp_limit_start_up","ramp_limit_shut_down", "start_up_cost", "shut_down_cost", "min_up_time", "min_down_time"] #,"p_min_pu"]
+    uc_params = ["ramp_limit_start_up","ramp_limit_shut_down", "start_up_cost", "shut_down_cost", "min_up_time", "min_down_time", "p_min_pu", "committable"]
     params += uc_params    
     param_cols = [p for p in params if p not in ["bus","carrier","p_nom"]]
 
@@ -691,9 +704,10 @@ def group_components(component_df, attrs):
         grouped_df["p_nom"] = filtered_df.groupby(["Grouping", "carrier", "bus"]).sum()["p_nom"]
         grouped_df["build_year"] = filtered_df.groupby(["Grouping", "carrier", "bus"]).min()["build_year"]
         grouped_df["lifetime"] = filtered_df.groupby(["Grouping", "carrier", "bus"]).max()["lifetime"]
+        grouped_df["committable"] = filtered_df.groupby(["Grouping", "carrier", "bus"]).max()["committable"]
         
         # calculate weighted average of remaining parameters in gens dataframe
-        for param in [p for p in params if p not in ["bus","carrier","p_nom", "lifetime", "build_year"]]:
+        for param in [p for p in params if p not in ["bus","carrier","p_nom", "lifetime", "build_year","committable"]]:
             weighted_sum = filtered_df.groupby(["Grouping", "carrier", "bus"]).apply(lambda x: (x[param] * x["p_nom"]).sum())
             total_p_nom = filtered_df.groupby(["Grouping", "carrier", "bus"])["p_nom"].sum()
             weighted_average = weighted_sum / total_p_nom 
@@ -706,8 +720,8 @@ def group_components(component_df, attrs):
     
     non_grouped_df = component_df[~component_df["apply_grouping"]][params].copy()
     # Fill missing values with default values (excluding defaults that are NaN)    
-    grouped_df = apply_default_attr(grouped_df, attrs)
-    non_grouped_df = apply_default_attr(non_grouped_df, attrs)
+    grouped_df = apply_default_attr(grouped_df, attrs, snakemake)
+    non_grouped_df = apply_default_attr(non_grouped_df, attrs, snakemake)
 
     return grouped_df, non_grouped_df
 
@@ -725,6 +739,7 @@ def attach_fixed_generators(n, carriers):
     # load generators from model file
     gens = load_fixed_components(carriers, start_year, snakemake.config["electricity"], "Generator")
     gens = map_components_to_buses(gens, snakemake.input.supply_regions, snakemake.config["gis"]["crs"])
+    
     pu_profiles = init_pu_profiles(gens, snapshots)
 
     unique_entries = set()
@@ -776,22 +791,20 @@ def attach_fixed_generators(n, carriers):
 
     n.generators_t.p_nom_pu = p_nom_pu
     n.generators_t.p_max_pu = pu_max.clip(lower=0.0, upper=1.0)
-    n.generators_t.p_min_pu = pu_min.clip(lower=0.0, upper=1.0)
-    
+    if MODEL_TYPE == "capacity":
+        n.generators_t.p_min_pu = pu_min.clip(lower=0.0, upper=1.0)
+        commitable_carriers = snakemake.config["electricity"]["conventional_generators"]["linearised_unit_committment_in_capacity_expansion"]
+        if commitable_carriers != False:
+            not_committable = n.generators.query("carrier not in @commitable_carriers").index
+            n.generators.loc[not_committable, "committable"] = False
+        else:
+            n.generators.loc[:, "committable"] = False
+    else:
+        # If building dispatch model, only assign p_min_pu to non unit committment generators
+        non_uc_gens = n.generators[~n.generators.committable].index
+        n.generators_t.p_min_pu[non_uc_gens] = pu_min[non_uc_gens].clip(lower=0.0, upper=1.0)
     #for carrier, value in snakemake.config["electricity"]["min_hourly_station_gen"]["fixed"].items():
     #    clip_pu_profiles(n, "p_min_pu", n.generators.query("carrier == @carrier & p_nom_extendable == False").index, lower=value, upper=1.0)
-
-# def extendable_max_build_per_bus_per_carrier():
-
-#     ext_max_build = (
-#         pd.read_excel(
-#             model_file, 
-#             sheet_name='ext_max_total',
-#             index_col=[0,1,2,3,4])
-#     ).loc[scenario_setup]
-#     ext_max_build.replace("unc", np.inf, inplace=True)
-
-#     return ext_max_build.loc[snakemake.wildcards.regions]
 
 def define_extendable_tech(carriers, years, type_, ext_param):
 
@@ -842,7 +855,6 @@ def attach_extendable_generators(n, carriers):
     ext_param = load_extendable_parameters(n, scenario_setup, snakemake)
     ext_gens_list = define_extendable_tech(carriers, ext_years, "Generator", ext_param) 
     gens = set_extendable_params("Generator", ext_gens_list, ext_param)
-    gens = set_annual_build_limits(gens, ext_years, "Generator")
      
     pu_profiles = init_pu_profiles(gens, snapshots)
     
@@ -864,6 +876,13 @@ def attach_extendable_generators(n, carriers):
     pu_profiles = generate_extendable_wind_solar_profiles(n, gens, snapshots, re_carriers, pu_profiles)
     
     gens = drop_non_pypsa_attrs(n, "Generator", gens)
+
+    if MODEL_TYPE == "capacity":
+        gens = set_annual_build_limits(gens, ext_years, "Generator")
+        gens["committable"] = False
+    elif MODEL_TYPE == "dispatch":
+         gens["p_nom_extendable"] = False # cannot have both UC and extendable
+
     n.import_components_from_dataframe(gens, "Generator")
     n.generators["plant_name"] = n.generators.index.str.split("*").str[0]
 
@@ -872,7 +891,9 @@ def attach_extendable_generators(n, carriers):
     pu_max, pu_min = pu_profiles.loc["max", in_network], pu_profiles.loc["min", in_network]
     pu_max.index, pu_min.index = n.snapshots, n.snapshots
     n.generators_t.p_max_pu.loc[:, in_network] = pu_max.loc[:, in_network].clip(lower=0.0, upper=1.0)
-    n.generators_t.p_min_pu.loc[:, in_network] = pu_min.loc[:, in_network].clip(lower=0.0, upper=1.0)
+    
+    if MODEL_TYPE == "capacity": #p_min_pu is min stable level fo dispatch model, so only set p_mn_pu her for capacity model
+        n.generators_t.p_min_pu.loc[:, in_network] = pu_min.loc[:, in_network].clip(lower=0.0, upper=1.0)
 
     #for carrier, value in snakemake.config["electricity"]["min_hourly_station_gen"]["fixed"].items():
     #    clip_pu_profiles(n, "p_min_pu", n.generators.query("carrier == @carrier & p_nom_extendable").index, lower=value, upper=1.0)
@@ -936,8 +957,12 @@ def set_extendable_params(c, bus_carrier_years, ext_param, **config):
         "min_down_time",
         "start_up_cost",
         "shut_down_cost",
+        "committable", 
+        "p_min_pu"
     ]
 
+    if MODEL_TYPE == "dispatch":
+        default_param += uc_param
 
     if c == "StorageUnit":
         default_param += ["max_hours", "efficiency_store", "efficiency_dispatch"]
@@ -952,10 +977,10 @@ def set_extendable_params(c, bus_carrier_years, ext_param, **config):
     component_df["build_year"] = component_df.index.str.split("-").str[2].astype(int)
     
     if c == "Generator":
-        component_df = pd.concat([component_df, pd.DataFrame(index = bus_carrier_years, columns = uc_param)],axis=1)
-        for param in default_col + uc_param:
+        #component_df = pd.concat([component_df, pd.DataFrame(index = bus_carrier_years, columns = uc_param)],axis=1)
+        for param in default_col:
             component_df[param] =  component_df.apply(lambda row: ext_param.loc[(param, row["carrier"]), row["build_year"]], axis=1)
-            component_df = apply_default_attr(component_df, n.component_attrs[c])
+            component_df = apply_default_attr(component_df, n.component_attrs[c], snakemake)
     elif c == "StorageUnit":
         for param in default_col:
             component_df[param] =  component_df.apply(lambda row: ext_param.loc[(param, row["carrier"]), row["build_year"]], axis=1)
@@ -974,7 +999,7 @@ def apply_extendable_phase_in(n):
     pu_max = get_as_dense(n, "Generator", "p_max_pu")
     ext_i = n.generators.query("p_nom_extendable").index
     
-    phase_in = pd.DataFrame(1, index =range(8760), columns = ["overnight", "linear", "quarterly"]) 
+    phase_in = pd.DataFrame(1, index =range(8760), columns = ["overnight", "linear", "quarterly"], dtype=float) 
     phase_in.loc[:, "linear"] = np.round(np.arange(0, 1, 1/8760),3)
     phase_in.loc[:2190, "quarterly"] = 0.25
     phase_in.loc[2190:4380, "quarterly"] = 0.5
@@ -1001,20 +1026,35 @@ def apply_extendable_phase_in(n):
 
 
 def adjust_for_variable_fuel_costs(n):
+    config = snakemake.config["electricity"]["conventional_generators"]["variable_fuel_prices"]
+
+    if config["fixed"] + config["extendable"] == 0:
+        return
+    
     param = load_extendable_parameters(n, scenario_setup, snakemake)
     # check if any variation in marginal cost across years
     variable_fuel_cost = param.loc["fuel", n.investment_periods]
-    variable_fuel_cost = variable_fuel_cost[variable_fuel_cost.mean(axis=1) != variable_fuel_cost.iloc[:, 0]]
+    variable_fuel_cost = variable_fuel_cost[(np.abs(variable_fuel_cost.diff(axis=1).fillna(0))>0.1).max(axis=1)]
 
-    gen_list = n.generators.query("carrier in @variable_fuel_cost.index").index
-    marginal_cost = pd.DataFrame(index = n.snapshots, columns = gen_list)
+    if variable_fuel_cost.empty:
+        return
+    
+    if config["fixed"] & config["extendable"]:
+        gen_list = n.generators.query("carrier in @variable_fuel_cost.index").index
+    elif config["fixed"]:
+        gen_list = n.generators.query("carrier in @variable_fuel_cost.index & p_nom_extendable == False").index
+    elif config["extendable"]:
+        gen_list = n.generators.query("carrier in @variable_fuel_cost.index & p_nom_extendable").index
+
+    marginal_cost = pd.DataFrame(index = n.snapshots, columns = gen_list, dtype=float)
     for carrier in variable_fuel_cost.index:
         for gen in n.generators.query("carrier == @carrier").index:
             cost = variable_fuel_cost.loc[carrier] / n.generators.loc[gen, "efficiency"] + param.loc[("VOM", carrier), n.investment_periods]
             for y in n.investment_periods:
                 marginal_cost.loc[y, gen_list] = cost.loc[y]
-            n.generators.marginal_cost[gen] = 0
-            n.generators_t.marginal_cost[gen] = marginal_cost[gen]
+            if gen in marginal_cost.columns:
+                n.generators.marginal_cost[gen] = 0
+                n.generators_t.marginal_cost[gen] = marginal_cost[gen]
 
 def set_hourly_coal_generation_threshold(n):
     if scenario_setup["min_station_hourly"] in ["NA", "None", "none"]:
@@ -1062,57 +1102,17 @@ def attach_extendable_storage(n, carriers):
     ext_param = load_extendable_parameters(n, scenario_setup, snakemake)
     ext_storage_list = define_extendable_tech(carriers, ext_years, "StorageUnit", ext_param)
     storage = set_extendable_params("StorageUnit", ext_storage_list, ext_param, **config)
-    storage = set_annual_build_limits(storage, ext_years, "StorageUnit")
+    if MODEL_TYPE == "capacity":
+        storage = set_annual_build_limits(storage, ext_years, "StorageUnit")
     if len(ext_storage_list):
         storage = drop_non_pypsa_attrs(n, "StorageUnit", storage)
         n.import_components_from_dataframe(storage, "StorageUnit")
 
-"""
-********************************************************************************
-    Transmission network functions  
-********************************************************************************
-"""
 
-# def convert_lines_to_links(n):
-#     """
-#     Convert AC lines to DC links for multi-decade optimisation with line
-#     expansion.
-
-#     Losses of DC links are assumed to be 3% per 1000km
-#     """
-#     years = get_investment_periods(n.snapshots, n.multi_invest)
-
-#     logger.info("Convert AC lines to DC links to perform multi-decade optimisation.")
-#     extendable = False
-#     p_nom = n.lines.s_nom
-
-#     for y in years:
-#         n.madd(
-#             "Link",
-#             n.lines.index + "_" + str(y),
-#             bus0 = n.lines.bus0,
-#             bus1 = n.lines.bus1,
-#             p_nom = p_nom,
-#             p_nom_min = n.lines.s_nom,
-#             p_min_pu = -1,
-#             lifetime = 100,
-#             efficiency = 1 - 0.03 * n.lines.length / 1000,
-#             marginal_cost = 0,
-#             length = n.lines.length,
-#             capital_cost = n.lines.capital_cost,
-#             p_nom_extendable = extendable,
-#         )
-#         if y == years[0]:
-#             extendable = True
-#             p_nom = 0
-
-#     # Remove AC lines
-#     logger.info("Removing AC lines")
-#     lines_rm = n.lines.index
-#     n.mremove("Line", lines_rm)
-
-
-
+def adjust_com_msl(n):
+    com_i = n.generators.query("committable").index
+    n.generators_t.p_min_pu[com_i] = get_as_dense(n, "Generator", "p_min_pu")[com_i] * get_as_dense(n, "Generator", "p_max_pu")[com_i]
+    n.generators.loc[com_i, "p_min_pu"] = 0
 """
 ********************************************************************************
     Other functions
@@ -1131,8 +1131,8 @@ def check_pu_profiles(clean_flag):
             f'Some generators have p_max_pu < p_min_pu in some hours. This will cause the problem to be infeasible.\nEither set clean_pu_profiles under config to True or correct input assumptions. Errors can be found in the follwing generators:\n{error_lst[error_lst].index}'
         )
     elif errors.any().any() and clean_flag:
-        logging.info(f"Adjusting by p_max_pu for {error_lst[error_lst].index}")
-        n.generators_t.p_max_pu = p_max_pu.where(~errors, p_min_pu)
+        logging.info(f"Adjusting by p_min_pu to match p_max_pu to avoid infeasibilities for the following generators {list(error_lst[error_lst].index)}")
+        n.generators_t.p_min_pu = p_min_pu.where(~errors, p_max_pu)
 
 
 def add_carrier_emissions(n):
@@ -1175,7 +1175,7 @@ def add_load_shedding(n, cost):
     n.madd(
         "Generator",
         buses_i,
-        "_load_shedding",
+        "-load_shedding",
         bus = buses_i,
         p_nom = 1e6,  # MW
         carrier = "load_shedding",
@@ -1196,16 +1196,13 @@ if __name__ == "__main__":
     if "snakemake" not in globals():
         from _helpers import mock_snakemake
         snakemake = mock_snakemake(
-            "add_electricity", 
+            "add_electricity_dispatch", 
             **{
-                "model_type":"capacity",
-                "scenario":"AMBITIONS_LC2",
+                "scenario":"CNS_G_RNZ_CB",
+                "year":"2030",
             }
         )
-
-    scenario_path = snakemake.output[0].split("capacity")[0]
-    if not os.path.exists(scenario_path):
-        os.makedirs(scenario_path)
+    MODEL_TYPE = snakemake.output[0].split(f"{snakemake.wildcards.scenario}/")[1].split("-")[0]
 
     #configure_logging(snakemake, skip_handlers=False)
     logging.basicConfig(
@@ -1237,24 +1234,30 @@ if __name__ == "__main__":
     logging.info("Attaching extendable storage")
     attach_extendable_storage(n, carriers)
 
-    logging.info("Adjusting for changes in fuel price over time")
-    adjust_for_variable_fuel_costs(n)
+    if MODEL_TYPE == "capacity":
+        adj_by_pu = snakemake.config["electricity"]["adjust_by_p_max_pu"]
+        logging.info(f"Adjusting by p_max_pu for {list(adj_by_pu.keys())}")
+        adjust_by_p_max_pu(n, adj_by_pu)
 
-    adj_by_pu = snakemake.config["electricity"]["adjust_by_p_max_pu"]
-    logging.info(f"Adjusting by p_max_pu for {list(adj_by_pu.keys())}")
-    adjust_by_p_max_pu(n, adj_by_pu)
+        logging.info("Adjusting for changes in fuel price over time")
+        adjust_for_variable_fuel_costs(n)
 
-    logging.info("Applying coal minimum generation threshold")
-    set_hourly_coal_generation_threshold(n)
+        logging.info("Applying coal minimum generation threshold")
+        set_hourly_coal_generation_threshold(n)
 
-    logging.info("Applying phase in of extendable generators")
-    apply_extendable_phase_in(n)
+        logging.info("Applying phase in of extendable generators")
+        apply_extendable_phase_in(n)
     
-    logging.info("Checking pu_profiles for infeasibilities")
-    check_pu_profiles(snakemake.config["electricity"]["clean_pu_profiles"])
+        logging.info("Checking pu_profiles for infeasibilities")
+        check_pu_profiles(snakemake.config["electricity"]["clean_pu_profiles"])
+    else:
+        logging.info("Adjusting min stable level base on p_max_pu")
+        adjust_com_msl(n)
 
-    if snakemake.config["solving"]["options"]["load_shedding"]:
-        ls_cost = snakemake.config["costs"]["load_shedding"]
+
+
+    if snakemake.config["costs"]["load_shedding"]:
+        ls_cost = snakemake.config["costs"]["COUE"]
         logging.info("Adding load shedding")
         add_load_shedding(n, ls_cost) 
 
@@ -1264,10 +1267,5 @@ if __name__ == "__main__":
     if n.multi_invest:
         initial_ramp_rate_fix(n)
 
-    if snakemake.wildcards.model_type == "dispatch":
-        for y in n.investment_periods:
-            sns = n.snapshots[n.snapshots.get_level_values("period")==y]
-            n_y = single_year_network_copy(n, snapshots=sns, investment_periods=sns.unique("period"))
-            n_y.export_to_netcdf(f"{scenario_path}/dispatch_{y}.nc") 
-    else:
-        n.export_to_netcdf(snakemake.output[0])
+    n.export_to_netcdf(snakemake.output[0])
+

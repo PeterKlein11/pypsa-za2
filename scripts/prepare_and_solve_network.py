@@ -72,6 +72,7 @@ from custom_constraints import set_operational_limits, ccgt_steam_constraints, r
 idx = pd.IndexSlice
 import os
 
+
 """
 ********************************************************************************
     Build limit constraints
@@ -164,60 +165,30 @@ def add_emission_prices(n, emission_prices=None, exclude_co2=False):
     n.generators["marginal_cost"] += n.generators.carrier.map(ep)
     n.storage_units["marginal_cost"] += n.storage_units.carrier.map(ep)
 
-# """
-# ********************************************************************************
-#     Transmission constraints
-# ********************************************************************************
-# """
+"""
+********************************************************************************
+    Linear unit commitment constraints
+********************************************************************************
+"""
+def set_max_status(n, sns):
 
-# def set_line_s_max_pu(n):
-#     s_max_pu = snakemake.config["lines"]["s_max_pu"]
-#     n.lines["s_max_pu"] = s_max_pu
-#     logger.info(f"N-1 security margin of lines set to {s_max_pu}")
+    status_idx = n.generators.query("committable == True").index
+    status_max = n.get_switchable_as_dense("Generator", "p_max_pu")[status_idx].copy()
+    n.generators_t.p_max_pu[status_idx] = 1
 
+    # remove time varying p_min_pu for committable
+    remove_list = [sm for sm in status_max.columns if sm in n.generators_t.p_min_pu.columns]
+    n.generators_t.p_min_pu.drop(remove_list, axis=1, inplace=True) 
+    n.generators.up_time_before = n.generators.min_up_time
 
-# def set_transmission_limit(n, ll_type, factor, costs, Nyears=1):
-#     links_dc_b = n.links.carrier == "DC" if not n.links.empty else pd.Series()
-
-#     _lines_s_nom = (
-#         np.sqrt(3)
-#         * n.lines.type.map(n.line_types.i_nom)
-#         * n.lines.num_parallel
-#         * n.lines.bus0.map(n.buses.v_nom)
-#     )
-#     lines_s_nom = n.lines.s_nom.where(n.lines.type == "", _lines_s_nom)
-
-#     col = "capital_cost" if ll_type == "c" else "length"
-#     ref = (
-#         lines_s_nom @ n.lines[col]
-#         + n.links.loc[links_dc_b, "p_nom"] @ n.links.loc[links_dc_b, col]
-#     )
-
-#     update_transmission_costs(n, costs)
-
-#     if factor == "opt" or float(factor) > 1.0:
-#         n.lines["s_nom_min"] = lines_s_nom
-#         n.lines["s_nom_extendable"] = True
-
-#         n.links.loc[links_dc_b, "p_nom_min"] = n.links.loc[links_dc_b, "p_nom"]
-#         n.links.loc[links_dc_b, "p_nom_extendable"] = True
-
-#     if factor != "opt":
-#         con_type = "expansion_cost" if ll_type == "c" else "volume_expansion"
-#         rhs = float(factor) * ref
-#         n.add(
-#             "GlobalConstraint",
-#             f"l{ll_type}_limit",
-#             type=f"transmission_{con_type}_limit",
-#             sense="<=",
-#             constant=rhs,
-#             carrier_attribute="AC, DC",
-#         )
-#     return n
-
-# def set_line_nom_max(n, s_nom_max_set=np.inf, p_nom_max_set=np.inf):
-#     n.lines.s_nom_max.clip(upper=s_nom_max_set, inplace=True)
-#     n.links.p_nom_max.clip(upper=p_nom_max_set, inplace=True)
+    status = n.model.variables["Generator-status"].sel({"Generator-com":status_max.columns})
+    lhs = status.sel(snapshot=sns)
+    if status_max.columns.name != "Generator-com":
+        status_max.columns.name = "Generator-com"
+    rhs = xr.DataArray(status_max.loc[sns])   
+    n.model.add_constraints(lhs, "<=", rhs, name="max_status")
+    
+    return status_max
 
 """
 ********************************************************************************
@@ -362,17 +333,22 @@ def calc_cumulative_new_capacity(n):
     return new_capacity
 
 def solve_network(n, sns):
-    
-    n.optimize.create_model(snapshots = sns, multi_investment_periods = n.multi_invest)
-    # Custom constraints
-    set_operational_limits(n, sns, scenario_setup)
+    com_i = n.generators.query("committable == True").index
+    if not com_i.empty:
+        n.optimize.create_model(snapshots = sns, multi_investment_periods = n.multi_invest, linearized_unit_commitment = True)
+        set_max_status(n, sns)
+    else:
+        n.optimize.create_model(snapshots = sns, multi_investment_periods = n.multi_invest)    
+
+    set_operational_limits(n, sns, scenario_setup, snakemake)
     ccgt_steam_constraints(n, sns, snakemake)
     reserve_margin_constraints(n, sns, scenario_setup, snakemake)
     
     param = load_extendable_parameters(n, scenario_setup, snakemake)
     annual_co2_constraints(n, sns, param, scenario_setup)
-    solver_name = snakemake.config["solving"]["solver"].pop("name")
-    solver_options = snakemake.config["solving"]["solver"].copy()
+    solver_name = snakemake.config["capacity_solver"]["solver"].pop("name")
+    solver_options = snakemake.config["capacity_solver"]["solver"].copy()
+
     n.optimize.solve_model(solver_name=solver_name, solver_options=solver_options)
 
 if __name__ == "__main__":
@@ -381,14 +357,20 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             'prepare_and_solve_network', 
             **{
-                'scenario':'LC_UNC',
+                'scenario':'CNS_G_RNZ_CB_UC',
             }
         )
-    logging.info("Preparing costs")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(levelname)s: %(asctime)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    logging.info("Loading network")
 
     n = pypsa.Network(snakemake.input[0])
     scenario_setup = load_scenario_definition(snakemake)
-    
+
     opts = scenario_setup["options"].split("-")
     for o in opts:
         m = re.match(r"^\d+h$", o, re.IGNORECASE)

@@ -51,12 +51,8 @@ def apply_operational_constraints(n, sns, **kwargs):
     apply_to = kwargs["apply_to"]
 
     carrier = [c.strip() for c in kwargs["carrier"].split("+")]
-
-    #if carrier in ["gas", "diesel"]:
-    #    carrier = n.carriers[n.carriers.index.str.contains(carrier)].index
     bus = kwargs["bus"]
     period = kwargs["period"]
-
     type_ = "energy_power" if kwargs["type"] in ["primary_energy", "output_energy", "output_power"] else "capacity_factor"
 
     if (period  == "week") & (max(n.snapshot_weightings["generators"])>1):
@@ -67,6 +63,9 @@ def apply_operational_constraints(n, sns, **kwargs):
     limit = kwargs["limit"]
 
     sense = "<=" if limit == "max" else ">="
+
+    if len(sns) <8760 and not n.multi_invest and period in ["week", "month"]: #conditions for rolling horizon analysis monthly
+        sns = sns[sns.month == sns.month[0]] # ignore overlap with next month for monthly limits
 
     cf_limit = 0 * kwargs["values"] if type_ == "energy_power" else kwargs["values"]
     en_pow_limit = 0 * kwargs["values"] if type_ == "capacity_factor" else kwargs["values"]
@@ -114,32 +113,25 @@ def apply_operational_constraints(n, sns, **kwargs):
             if len(year_sns) > 0:
                 if type_ == "capacity_factor":
                     lhs = (act_gen - max_gen_ext) 
-                    if (isinstance(max_gen_fix, int)) | (isinstance(max_gen_fix, float)):
+                    if isinstance(max_gen_fix, (int, float)):
                         rhs = max_gen_fix
+                        skip_constraint = 0 if rhs >=0 else 1
                     else:
                         rhs = max_gen_fix.loc[y] if n.multi_invest else max_gen_fix.loc[year_sns]
+                        skip_constraint = 0 if (rhs >=0).any().any() else 1
                 else:
                     lhs = act_gen
                     rhs = en_pow_limit[y]
-                lhs = lhs.sel(snapshot=year_sns)
-                lhs_p = lhs.sum() if period == "year" else lhs.groupby(groupby).sum()
-
-                # if period == "month":
-                #     if isinstance(rhs, int) or isinstance(rhs, float):
-                #         rhs_p = rhs
-                #     else:
-                #         rhs_p = group_and_sum(rhs, lambda x: x.index.month)
-                #         rhs_p.index.name = period
-                # elif period == "week":
-                #     if isinstance(rhs, int) or isinstance(rhs, float):
-                #         rhs_p = rhs
-                #     else:
-                #         rhs_p = group_and_sum(rhs, lambda x: x.index.isocalendar().week)
-                #         rhs_p.index.name = period
-                # else:  # period == "year"
-                #     rhs_p = rhs if isinstance(rhs, int) or isinstance(rhs, float) else rhs.sum().sum()
-                rhs_p = rhs if isinstance(rhs, int) else rhs.sum().sum()
-                n.model.add_constraints(lhs_p, sense, rhs_p, name=f'{limit}-{kwargs["carrier"]}-{period}-{kwargs["apply_to"][:3]}-{y}')
+                    skip_constraint = 0 if rhs >0 else 1 
+                if not skip_constraint:
+                    lhs = lhs.sel(snapshot=year_sns)
+                    lhs_p = lhs.sum() if period == "year" else lhs.groupby(groupby).sum()
+                    rhs_p = (
+                        rhs
+                        if isinstance(rhs, (int, float))
+                        else xr.DataArray(rhs).groupby(groupby).sum()
+                    )
+                    n.model.add_constraints(lhs_p, sense, rhs_p, name=f'{limit}-{kwargs["carrier"]}-{period}-{kwargs["apply_to"][:3]}-{y}')
 
     else:
 
@@ -147,33 +139,46 @@ def apply_operational_constraints(n, sns, **kwargs):
         if kwargs["type"] == "output_energy":
             logging.warning("Energy limits are not yet implemented for hourly operational limits.")
             return
-    
+
         if type_ == "capacity_factor":
-            rhs = (
-                max_gen_fix
-                if isinstance(max_gen_fix, int)
-                else xr.DataArray(
-                    max_gen_fix.loc[sns_active].sum(axis=1)
-                ).rename({"dim_0": "snapshot"})
-            )
+            if isinstance(max_gen_fix, int):
+                rhs = max_gen_fix
+            else:
+                rhs = xr.DataArray(max_gen_fix.loc[sns_active].sum(axis=1))
+                rhs = rhs.rename({"dim_0": "snapshot"}) if rhs.dims[0] == "dim_0" else rhs # in the case of index name not being snapshot
+
         else:
             rhs = pd.Series(index = sns)
-            for y in years:
-                rhs.loc[y] = en_pow_limit[y]
-                
+            if n.multi_invest:
+                for y in years:
+                    rhs.loc[y] = en_pow_limit[y]
+            else:
+                rhs.loc[str(years[0])] = en_pow_limit[years[0]]
+
         n.model.add_constraints(lhs, sense, rhs, name = f'{limit}-{kwargs["carrier"]}-hour-{kwargs["apply_to"][:3]}')
 
-def set_operational_limits(n, sns, scenario_setup):
+def set_operational_limits(n, sns, scenario_setup, snakemake, exclude_flag=[], model_type="capacity"):
 
     op_limits = pd.read_excel(
         os.path.join(scenario_setup["sub_path"], "operational_constraints.xlsx"),
         sheet_name='operational_constraints',
         index_col=list(range(9)),
     )
-    
+
     if scenario_setup["operational_limits"] not in op_limits.index.get_level_values(0).unique():
+        logging.warning(f"Operational limits for scenario {scenario_setup['operational_limits']} not found, skipping.")
         return
     op_limits = op_limits.loc[scenario_setup["operational_limits"]]
+
+    if len(exclude_flag) > 0:
+        logging.warning(f"Excluding operational limits that are specified in {exclude_flag}.")
+        op_limits = op_limits.loc[~op_limits.index.get_level_values(3).str.contains("|".join(exclude_flag))]
+
+    if model_type == "dispatch":
+        logging.warning("Applying operation limits to all generators.")
+        op_limits = op_limits.reset_index()
+        op_limits["apply_to"] = "fixed"
+        op_limits = op_limits.set_index(op_limits.columns[:9].tolist())
 
     #drop rows where all NaN
     op_limits = op_limits.loc[~(op_limits.isna().all(axis=1))]

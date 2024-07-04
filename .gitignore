@@ -5,6 +5,11 @@ __pycache__
 ~$*
 **/.vscode/
 
+.~lock.*.xlsx#
+.~lock.*.xls#
+*.lock
+*.log
+
 archive/*
 benchmarks/*
 cutouts/*

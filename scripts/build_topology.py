@@ -79,7 +79,7 @@ def load_region_data(model_regions):
     gva_cols = ["SIC1_2016", "SIC2_2016", "SIC3_2016", "SIC4_2016", "SIC6_2016", "SIC7_2016", "SIC8_2016", "SIC9_2016"]
     pop_col = ["POP_2016"]
     for col in gva_cols + pop_col:
-        regions[col] = joined.groupby(joined.index_right).sum()[col]
+        regions[col] = joined[col].groupby(joined.index_right).sum()
     
     regions["GVA_2016"] = regions[gva_cols].sum(axis=1)
     if len(regions)>1:
@@ -92,7 +92,7 @@ def load_line_data(line_config):
     lines = gpd.read_file(snakemake.input.existing_lines)
     lines = lines.to_crs(snakemake.config["gis"]["crs"]["distance_crs"])
     lines['status'] = 'existing'
-    lines["build_year"] = int(scenario_setup["simulation_years"][:4]) - 1
+    lines["build_year"] = int(scenario_setup["capacity_expansion_years"][:4]) - 1
     lines.rename(columns={'DESIGN_VOL': 'voltage'}, inplace=True)
 
     if "+tdp" in scenario_setup.loc['transmission_grid']:
@@ -352,19 +352,18 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             'build_topology', 
             **{
-                'scenario':'CNS_G_RB_CB_10_7',
+                'scenario':'CNS_G_RNZ_CB',
             }
         )
     logging.info("Loading scenario configuration")
 
     scenario_setup = load_scenario_definition(snakemake)
-
-    years = scenario_setup.loc["simulation_years"]
+    years = scenario_setup.loc["capacity_expansion_years"]
     if not isinstance(years, int):
         years = list(map(int, re.split(",\s*", years)))
 
     logging.info("Loading region GIS data")
-    model_regions = str(scenario_setup.loc["regions"])
+    model_regions = str(int(scenario_setup.loc["regions"]))
     regions = load_region_data(model_regions)
 
     logging.info("Building regions")

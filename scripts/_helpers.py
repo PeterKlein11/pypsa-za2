@@ -552,7 +552,6 @@ def mock_snakemake(rulename, **wildcards):
         needed.
     """
     import os
-
     import snakemake as sm
     from pypsa.descriptors import Dict
     from snakemake.script import Snakemake
@@ -668,7 +667,7 @@ def map_component_parameters(tech, first_year, tech_flag):
         max_ramp_shut_down = 'Max Ramp Shut Down (%/h)',
         start_up_cost = 'Start Up Cost (R)',
         shut_down_cost = 'Shut Down Cost (R)',
-        p_min_pu = 'Min Stable Level (%)',
+        min_stable_level = 'Min Stable Level (%)',
         min_up_time = 'Min Up Time (h)',
         min_down_time = 'Min Down Time (h)',
         unit_size = 'Unit size (MW)',
@@ -677,13 +676,15 @@ def map_component_parameters(tech, first_year, tech_flag):
         out_rate = 'Typical annual forced outage rate (%)',
         st_efficiency="Round Trip Efficiency (%)",
         max_hours="Max Storage (hours)",
-        CSP_max_hours='CSP Storage (hours)'
+        CSP_max_hours='CSP Storage (hours)',
+        committable = "Dispatch Committable",
     )
 
     if tech_flag == 'Generator':
         tech['efficiency'] = (3.6/tech.pop(rename_dict['heat_rate'])).fillna(1)
         tech['ramp_limit_up'] = tech.pop(rename_dict['max_ramp_up'])
         tech['ramp_limit_down'] = tech.pop(rename_dict['max_ramp_down'])     
+        tech['p_min_pu'] = tech.pop(rename_dict['min_stable_level']).fillna(0)
         tech['ramp_limit_start_up'] = tech.pop(rename_dict['max_ramp_start_up'])
         tech['ramp_limit_shut_down'] = tech.pop(rename_dict['max_ramp_shut_down'])    
         tech['start_up_cost'] = tech.pop(rename_dict['start_up_cost']).fillna(0)
@@ -691,6 +692,7 @@ def map_component_parameters(tech, first_year, tech_flag):
         tech['min_up_time'] = tech.pop(rename_dict['min_up_time']).fillna(0)
         tech['min_down_time'] = tech.pop(rename_dict['min_down_time']).fillna(0)
         tech['marginal_cost'] = (3.6*tech.pop(rename_dict['fuel_price'])/tech['efficiency']).fillna(0) + tech.pop(rename_dict['vom'])
+        tech["committable"] = tech.pop(rename_dict["committable"]).fillna(0)
     else:
         tech["efficiency"] = tech.pop(rename_dict["st_efficiency"])
         tech["max_hours"] = tech.pop(rename_dict["max_hours"])
@@ -699,7 +701,7 @@ def map_component_parameters(tech, first_year, tech_flag):
     
     tech['capital_cost'] = 1e3*tech.pop(rename_dict['fom'])
     tech = tech.rename(
-        columns={rename_dict[f]: f for f in {'p_nom', 'name', 'carrier', 'x', 'y','build_year','decom_date','p_min_pu'}}
+        columns={rename_dict[f]: f for f in {'p_nom', 'name', 'carrier', 'x', 'y','build_year','decom_date'}}
     )
 
     tech['build_year'] = tech['build_year'].fillna(first_year-1).values
@@ -763,34 +765,48 @@ def get_investment_periods(sns, multi_invest):
 
 def adjust_by_p_max_pu(n, config):
     for carrier in config.keys():
-        gen_list = n.generators[n.generators.carrier == carrier].index
-        for p in config[carrier]:#["p_min_pu", "ramp_limit_up", "ramp_limit_down"]:
+        gen_list = n.generators.query("carrier == @carrier and not committable").index # only adjust ramp rates for non-committable generators
+        for p in config[carrier]:
             n.generators_t[p][gen_list] = (
                 get_as_dense(n, "Generator", p)[gen_list] * get_as_dense(n, "Generator", "p_max_pu")[gen_list]
             )
 
 def initial_ramp_rate_fix(n):
+    """
+    Under certain conditions the ramp rates of the generators between periods can lead to infeasibilities. 
+    This function sets the ramp rates of the first snapshot in each period to 1 to avoid this scenario.
+    """
     ramp_up_dense = get_as_dense(n, "Generator", "ramp_limit_up")
     ramp_down_dense = get_as_dense(n, "Generator", "ramp_limit_down")
-    p_min_pu_dense = get_as_dense(n, "Generator", "p_min_pu")
-
-    limit_up = ~ramp_up_dense.isnull().all()
-    limit_down = ~ramp_down_dense.isnull().all()
     
-    for y, y_prev in zip(n.investment_periods[1:], n.investment_periods[:-1]):
+    for y in n.investment_periods:
         first_sns = (y, f"{y}-01-01 00:00:00")
-        new_build = n.generators.query("build_year <= @y & build_year > @y_prev").index
+        ramp_up_dense.loc[first_sns] = 1
+        ramp_down_dense.loc[first_sns] = 1
+    
+    n.generators_t.ramp_limit_up = ramp_up_dense
+    n.generators_t.ramp_limit_down = ramp_down_dense
 
-        gens_up = new_build[limit_up[new_build]]
-        n.generators_t.ramp_limit_up.loc[:, gens_up] = ramp_up_dense.loc[:, gens_up]
-        n.generators_t.ramp_limit_up.loc[first_sns, gens_up] = np.maximum(p_min_pu_dense.loc[first_sns, gens_up], ramp_up_dense.loc[first_sns, gens_up])
+    #p_min_pu_dense = get_as_dense(n, "Generator", "p_min_pu")
+
+    # limit_up = ~ramp_up_dense.isnull().all()
+    # limit_down = ~ramp_down_dense.isnull().all()
+    
+    # for y, y_prev in zip(n.investment_periods[1:], n.investment_periods[:-1]):
+    #     first_sns = (y, f"{y}-01-01 00:00:00")
+    #     gen_list = np.unique(list(n.generators.query("build_year <= @y & build_year > @y_prev").index) + list(n.generators.query("carrier == 'coal'").index))
+
+    #     gens_up = gen_list[limit_up[gen_list]]
+
+    #     n.generators_t.ramp_limit_up.loc[y, gens_up] = ramp_up_dense.loc[y, gens_up]
+    #     n.generators_t.ramp_limit_up.loc[(y,first_sns), gens_up] = np.maximum(p_min_pu_dense.loc[first_sns, gens_up], ramp_up_dense.loc[first_sns, gens_up])
         
-        gens_down = new_build[limit_down[new_build]]
-        n.generators_t.ramp_limit_down.loc[:,gens_down] = ramp_down_dense.loc[:, gens_down]
-        n.generators_t.ramp_limit_down.loc[first_sns, gens_down] = np.maximum(p_min_pu_dense.loc[first_sns, gens_up], ramp_up_dense.loc[first_sns, gens_up])
+    #     gens_down = gen_list[limit_down[gen_list]]
+    #     n.generators_t.ramp_limit_down.loc[y,gens_down] = ramp_down_dense.loc[y, gens_down]
+    #     n.generators_t.ramp_limit_down.loc[(y, first_sns), gens_down] = np.maximum(p_min_pu_dense.loc[first_sns, gens_up], ramp_up_dense.loc[first_sns, gens_up])
 
 
-def apply_default_attr(df, attrs):
+def apply_default_attr(df, attrs, snakemake):
     params = [
         "bus", 
         "carrier", 
@@ -809,14 +825,17 @@ def apply_default_attr(df, attrs):
         "shut_down_cost", 
         "min_up_time", 
         "min_down_time",
-        #"p_min_pu",
+        "p_min_pu",
+        "committable",
     ]
+
     params += uc_params
-    
     default_attrs = attrs[["default","type"]]
     default_list = default_attrs.loc[default_attrs.index.isin(params), "default"].dropna().index
 
-    conv_type = {'int': int, 'float': float, "static or series": float, "series": float}
+    default_list = default_list[default_list.isin(df.columns)]
+
+    conv_type = {'int': int, 'float': float, "static or series": float, "series": float, 'boolean': bool}
     for attr in default_list:
         default = default_attrs.loc[attr, "default"]
         df[attr] = df[attr].fillna(conv_type[default_attrs.loc[attr, "type"]](default))
@@ -857,7 +876,7 @@ def get_carriers_from_model_file(scenario_setup):
             os.path.join(scenario_setup["sub_path"],"extendable_technologies.xlsx"), 
             sheet_name='active',
             index_col=[0,1,2],
-    ))[scenario_setup["extendable_techs"]]
+    ))[scenario_setup["extendable_active"]]
 
     ext_carriers = ext_carriers[ext_carriers==True].reset_index()
     ext_carriers= ext_carriers.drop_duplicates(subset='Carrier', keep='first').reset_index()[["Carrier", "Category"]]

@@ -12,6 +12,7 @@ import logging
 import pandas as pd
 import numpy as np
 import pypsa
+import os
 from xarray import DataArray
 #from _helpers import configure_logging, update_config_with_sector_opts
 #from solve_network import prepare_network, solve_network
@@ -19,181 +20,144 @@ from pypsa.descriptors import get_switchable_as_dense as get_as_dense, get_activ
 
 logger = logging.getLogger(__name__)
 
-from _helpers import (
-    _add_missing_carriers_from_costs,
-    convert_cost_units,
-    load_disaggregate, 
-    map_component_parameters, 
-    read_and_filter_generators,
-    remove_leap_day,
-    drop_non_pypsa_attrs,
-    normed,
-    get_start_year,
-    get_snapshots,
-    get_investment_periods,
-    adjust_by_p_max_pu,
-    apply_default_attr
-)
 
-from prepare_and_solve_network import (
-    set_operational_limits,
-    ccgt_steam_constraints,
-    rmippp_constraints,
-)
+from add_electricity import load_scenario_definition
+from custom_constraints import set_operational_limits
+from prepare_and_solve_network import ccgt_steam_constraints, set_max_status
 
-def get_min_stable_level(n, model_file, model_setup, existing_carriers, extended_carriers):
+
+
+def add_missing_year_and_interp(n_stats, category):
+    n_stats = n_stats[category]
+    return n_stats.reindex(range(n_stats.columns[0], n_stats.columns[-1]+1),axis=1).interpolate(axis=1)
+
+def set_optimal_capacities(n):
+    optimised_network_stats = pd.read_csv(snakemake.input.optimised_network_stats, index_col=[0,1],header=[0,1])
+    optimised_network_stats.columns = pd.MultiIndex.from_tuples([(x[0], int(x[1])) for x in optimised_network_stats.columns])
+
+    p_nom_opt = (
+        add_missing_year_and_interp(optimised_network_stats, "Optimal Capacity")
+        - add_missing_year_and_interp(optimised_network_stats, "Installed Capacity")
+    )
+    for c in p_nom_opt.index.levels[0].drop("Load"):
+        for bus in n.buses.index:
+            for carrier in p_nom_opt.loc[c].index:
+                plant = f"{bus}-{carrier}-{snakemake.wildcards.year}"
+                if plant in n.df(c).index:
+                    n.df(c).loc[plant, "p_nom"] = p_nom_opt.loc[(c,carrier), int(snakemake.wildcards.year)]
+
+
+def aggregate_coal_unit(n):
+    # In the capacity expansion model the coal generators are split into 2/3 sets of units represented by * or **
+    # This function aggregates the capacity of these units back into a single unit before the linear unit commitment
+
+    gen_param = n.generators.iloc[0]
+    sum_param = ["p_nom","p_nom_opt"]
+    top_param = ["p_nom_extendable", "committable"]
+    avg_param = [idx for idx in gen_param.index if (not isinstance(gen_param[idx], str) and idx not in sum_param+top_param)]
+
+    coal_units = n.generators[n.generators.index.str.contains("\*")].index
+    n.generators.loc["RSA-load_shedding", "plant_name"] = "RSA-load_shedding"
+    n.generators.index = n.generators.plant_name.values
+    index_series = pd.Series(n.generators.index)
+    duplicates = index_series[index_series.duplicated(keep=False)]
+    for g in duplicates.unique().tolist():
+        n.generators.loc[g, sum_param] = n.generators.loc[g, sum_param].sum().values
+        n.generators.loc[g, avg_param] = n.generators.loc[g, avg_param].mean().values
+    n.generators.drop_duplicates(inplace=True)
+    n.generators.index.name = "Generator"
+
+    n.generators_t.p_max_pu.rename({cu: cu.replace('*', '').strip() for cu in coal_units},axis=1, inplace=True)
+    n.generators_t.p_min_pu.rename({cu: cu.replace('*', '').strip() for cu in coal_units},axis=1, inplace=True)
+
+    for lim in ["p_max_pu", "p_min_pu"]:
+        pu = n.generators_t[lim].copy()
+        n.generators_t[lim] = pu.loc[:, ~pu.columns.duplicated()]
+
+
+def set_reserves(n, sns, scenario_setup, status_max):
+   
+    reserves = pd.read_excel(
+        os.path.join(scenario_setup["sub_path"],"operational_constraints.xlsx"), 
+        sheet_name = "operational_reserves",
+        index_col = [0,1],
+    ).loc[scenario_setup["operational_reserves"], int(snakemake.wildcards.year)]
+
+    #### Dispatchable generators
+    com_i = n.generators.query("committable == True").index
+    p_nom_com = n.generators.loc[com_i, "p_nom"]
+    p_com = n.model.variables["Generator-p"].sel(Generator=com_i, snapshot=sns)
+    com_status = n.model.variables["Generator-status"].sel({"Generator-com":com_i, "snapshot":sns}).rename({"Generator-com":"Generator"})
+    n.model.add_variables(lower=0, coords=n.model.variables["Generator-p"].sel(Generator=com_i, snapshot=sns).coords, name="Generator-spin_res")
+    n.model.add_variables(lower=0, coords=n.model.variables["Generator-p"].sel(Generator=com_i, snapshot=sns).coords, name="Generator-total_res")
     
-    existing_param = pd.read_excel(
-        model_file, 
-        sheet_name="fixed_conventional",
-        na_values=["-"],
-        index_col=[0,1]
-    ).loc[model_setup["fixed_conventional"]]
+    # Add dispatchable generator spinning reserves
+    gen_spin_res_lhs = n.model.variables["Generator-spin_res"].sel(snapshot=sns)
+    gen_spin_res_rhs =  com_status * p_nom_com - p_com
+    n.model.add_constraints(gen_spin_res_lhs <= gen_spin_res_rhs, name="Generator-spin_res")
     
-    existing_gens = n.generators.query("carrier in @existing_carriers & p_nom_extendable == False").index
-    existing_msl= existing_param.loc[existing_gens, "Min Stable Level (%)"].rename("p_min_pu")
+    # Add dispatchable generator total reserves
+    gen_total_res_lhs = n.model.variables["Generator-total_res"].sel(snapshot=sns) + p_com
+    gen_total_res_rhs =  DataArray(status_max*p_nom_com)
+    gen_total_res_rhs = gen_total_res_rhs.rename({"Generator-com":"Generator"}) if "Generator" in gen_total_res_rhs else gen_total_res_rhs
+    n.model.add_constraints(gen_total_res_lhs <= gen_total_res_rhs, name="Generator-total_res")
+
+    #### Energy storage
+    n.model.add_variables(lower=0, coords=n.model.variables["StorageUnit-p_store"].sel(snapshot=sns).coords, name="StorageUnit-res")
+    p_store = n.model.variables["StorageUnit-p_store"].sel(snapshot=sns)
+    p_dispatch = n.model.variables["StorageUnit-p_dispatch"].sel(snapshot=sns)
+    st_soc = n.model.variables["StorageUnit-state_of_charge"].sel(snapshot=sns)
+
+    st_res_lhs1 = n.model.variables["StorageUnit-res"].sel(snapshot=sns) + p_dispatch - p_store
+    st_res_rhs1 = DataArray(n.get_switchable_as_dense("StorageUnit", "p_max_pu")*n.storage_units.p_nom)
+    n.model.add_constraints(st_res_lhs1 <= st_res_rhs1, name="Storage_unit-res1")
+
+    st_res_lhs2 = n.model.variables["StorageUnit-res"].sel(snapshot=sns)
+    st_res_rhs2 = n.model.variables["StorageUnit-state_of_charge"].sel(snapshot=sns) + p_store
+    n.model.add_constraints(st_res_lhs2 <= st_res_rhs2, name="Storage_unit-res2")
+
+    #### Total reserves
+    tot_spin_res = n.model.variables["Generator-spin_res"].sum("Generator") + n.model.variables["StorageUnit-res"].sum("StorageUnit")
+    tot_res = n.model.variables["Generator-total_res"].sum("Generator") + n.model.variables["StorageUnit-res"].sum("StorageUnit")
+
+    n.model.add_constraints(tot_spin_res >= reserves["spinning"], name="Reserves-spin_res")
+    n.model.add_constraints(tot_res >= reserves["total"], name="Reserves-total_res")
+
+    return
+
+def custom_constraints_wrapper(scenario_setup):
+    def custom_constraints(n, sns):
+
+        #status_max = set_max_status(n, sns)
+        ccgt_steam_constraints(n, sns, snakemake)
+        set_operational_limits(n, sns, scenario_setup, snakemake, exclude_flag=["year"], model_type = "dispatch")
+        set_reserves(n, sns, scenario_setup, n.get_switchable_as_dense("Generator", "p_max_pu"))
+    return custom_constraints
+
+def optimize_with_monthly_rolling_horizon(n, snapshots=None, overlap=0, **kwargs):
     
-    extended_param = pd.read_excel(
-        model_file, 
-        sheet_name = "extendable_parameters",
-        index_col = [0,2,1],
-    ).sort_index().loc[model_setup["extendable_parameters"]]
+    snapshots = n.snapshots if snapshots is None else snapshots
+    extra_func = custom_constraints_wrapper(kwargs["scenario_setup"])
+    sns_cnt = 0
+    for m in range(1,13):
+        mnth_sns = snapshots[snapshots.month == m]
+        sns_overlap = overlap if m<12 else 0
+        sns = snapshots[sns_cnt: (sns_cnt + len(mnth_sns) + sns_overlap)]
 
-    extended_gens = n.generators.query("carrier in @extended_carriers & p_nom_extendable").index
-    extended_msl = pd.Series(index=extended_gens, name = "p_min_pu")
-    for g in extended_gens:
-        carrier = g.split("-")[1]
-        y = int(g.split("-")[2])
-        if y in extended_param.columns:
-            extended_msl[g] = extended_param.loc[("min_stable_level", carrier), y].astype(float)
-        else:
-            interp_data = extended_param.loc[("min_stable_level", carrier), :].drop(["unit", "source"]).astype(float)
-            interp_data = interp_data.append(pd.Series(index=[y], data=[np.nan])).interpolate()
-            extended_msl[g] = interp_data.loc[y]
+        print(f"Optimizing month {m} from snapshot {sns[0]} to {sns[-1]}")
 
-    return existing_msl, extended_msl
+        if m>1:
+            if not n.stores.empty:
+                n.stores.e_initial = n.stores_t.e.loc[snapshots[sns_cnt - 1]]
+            if not n.storage_units.empty:
+                n.storage_units.state_of_charge_initial = (
+                    n.storage_units_t.state_of_charge.loc[snapshots[sns_cnt - 1]]
+                )
+        n.optimize(snapshots = sns, linearized_unit_commitment=True, extra_functionality=extra_func, solver_name = kwargs["solver_name"], solver_options = kwargs["solver_options"])
+ 
+        sns_cnt += len(mnth_sns)
+    return n
 
-
-def set_max_status(n, sns, p_max_pu):
-
-    # init period = 100h to let model stabilise status
-    if sns[0] == n.snapshots[0]:
-        init_periods=100
-        n.generators_t.p_max_pu.loc[
-            sns[:init_periods], p_max_pu.columns
-        ] = p_max_pu.loc[sns[:init_periods], :].values
-        
-        n.generators_t.p_min_pu.loc[:,p_max_pu.columns] = get_as_dense(n, "Generator", "p_min_pu").loc[:,p_max_pu.columns]
-        n.generators_t.p_min_pu.loc[
-            sns[:init_periods], p_max_pu.columns
-        ] = 0
-        sns = sns[init_periods:]
-
-    active = get_activity_mask(n, "Generator", sns, p_max_pu.columns)
-    active.rename_axis("Generator-com", axis = 1, inplace = True)
-    p_max_pu = p_max_pu.loc[sns, active.any(axis=0)]
-    p_max_pu = p_max_pu.loc[sns, (p_max_pu != 1).any(axis=0)]
-
-    status = n.model.variables["Generator-status"].sel({"Generator-com":p_max_pu.columns})
-    lhs = status.sel(snapshot=sns)
-    if p_max_pu.columns.name != "Generator-com":
-        p_max_pu.columns.name = "Generator-com"
-    rhs = DataArray(p_max_pu)
-    
-    n.model.add_constraints(lhs, "<=", rhs, name="max_status")
-
-def set_upper_combined_status_bus(n, sns, p_max_pu):
-
-    active = get_activity_mask(n, "Generator", sns, p_max_pu.columns)
-    active.rename_axis("Generator-com", axis = 1, inplace = True)
-    p_max_pu = p_max_pu.loc[sns, active.any(axis=0)]
-    p_max_pu = p_max_pu.loc[:, (p_max_pu != 1).any(axis=0)]
-
-    for bus_i in n.buses.index:
-        bus_gens = n.generators.query("bus == @bus_i").index.intersection(p_max_pu.columns)
-        if len(bus_gens) >= 0: 
-            p_nom = n.generators.loc[bus_gens, "p_nom"]
-            p_nom.name = "Generator-com"
-            status = n.model.variables["Generator-status"].sel({"snapshot":sns, "Generator-com":bus_gens})
-
-            p_nom_df = pd.DataFrame(index = sns, columns = p_nom.index)        
-            p_nom_df.loc[:] = p_nom.values
-            p_nom_df.rename_axis("Generator-com", axis = 1, inplace = True)
-
-            active.columns.name = "Generator-com"
-            lhs = (DataArray(p_nom_df) * status).sum("Generator-com")
-            rhs = (p_nom * p_max_pu[bus_gens]).sum(axis=1)
-            
-            n.model.add_constraints(lhs, "<=", rhs, name=f"{bus_i}-max_status")
-
-
-def set_upper_avg_status_over_sns(n, sns, p_max_pu):
-    
-    active = get_activity_mask(n, "Generator", sns, p_max_pu.columns)
-    active.rename_axis("Generator-com", axis = 1, inplace = True)
-    p_max_pu = p_max_pu.loc[sns, active.any(axis=0)]
-    p_max_pu = p_max_pu.loc[:, (p_max_pu != 1).any(axis=0)]
-
-    weightings = pd.DataFrame(index = sns, columns = p_max_pu.columns)
-    weight_values = n.snapshot_weightings.generators.loc[sns].values.reshape(-1, 1)
-    weightings.loc[:] = weight_values
-    weightings.rename_axis("Generator-com", axis = 1, inplace = True)
-
-    status = n.model.variables["Generator-status"].sel({"Generator-com":p_max_pu.columns, "snapshot":sns})
-    lhs = (status * weightings).sum("snapshot")
-    if p_max_pu.columns.name != "Generator-com":
-        p_max_pu.columns.name = "Generator-com"
-    rhs = (weightings * p_max_pu).sum()
-
-    n.model.add_constraints(lhs, "<=", rhs, name="upper_avg_status_sns")
-
-def set_max_status4(n, sns, p_max_pu):
-    
-    # init period = 100h to let model stabilise status
-    # if sns[0] == n.snapshots[0]:
-    #     init_periods=100
-    #     n.generators_t.p_max_pu.loc[
-    #         sns[:init_periods], p_max_pu.columns
-    #     ] = p_max_pu.loc[sns[:init_periods], :].values
-        
-    #     n.generators_t.p_min_pu.loc[:,p_max_pu.columns] = get_as_dense(n, "Generator", "p_min_pu").loc[:,p_max_pu.columns]
-    #     n.generators_t.p_min_pu.loc[
-    #         sns[:init_periods], p_max_pu.columns
-    #     ] = 0
-    #     sns = sns[init_periods:]
-
-    active = get_activity_mask(n, "Generator", sns, p_max_pu.columns)
-    p_max_pu = p_max_pu.loc[sns, active.any(axis=0)]
-
-    active.columns.name = "Generator-com"
-    status = n.model.variables["Generator-status"].sel({"Generator-com":p_max_pu.columns})
-    lhs = status.sel(snapshot=sns).groupby("snapshot.week").sum()
-    if p_max_pu.columns.name != "Generator-com":
-        p_max_pu.columns.name = "Generator-com"
-    rhs = p_max_pu.groupby(p_max_pu.index.isocalendar().week).sum()
-    
-    n.model.add_constraints(lhs, "<=", rhs, name="max_status")
-
-def set_existing_committable(n, sns, model_file, model_setup, config):
-
-    existing_carriers = config['existing']
-    existing_gen = n.generators.query("carrier in @existing_carriers & p_nom_extendable == False").index.to_list()
-
-    extended_carriers = config['extended']
-    extended_gen = n.generators.query("carrier in @extended_carriers & p_nom_extendable").index.to_list()
-    
-    n.generators.loc[existing_gen + extended_gen, "committable"] = True
-
-    p_max_pu = get_as_dense(n, "Generator", "p_max_pu", sns)[existing_gen + extended_gen].copy()
-    n.generators_t.p_max_pu.loc[:, existing_gen + extended_gen] = 1
-    n.generators.loc[existing_gen + extended_gen, "p_max_pu"] = 1
-
-    existing_msl, extended_msl = get_min_stable_level(n, model_file, model_setup, existing_carriers, extended_carriers)
-
-    n.generators.loc[existing_gen, "p_min_pu"] = existing_msl
-    n.generators.loc[extended_gen, "p_min_pu"] = extended_msl
-
-    return p_max_pu
 
 if __name__ == "__main__":
     if 'snakemake' not in globals():
@@ -201,34 +165,22 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             'solve_network_dispatch', 
             **{
-                'model_file':'TEST',
-                'regions':'1',
-                'resarea':'redz',
-                'll':'copt',
-                'opts':'LC',
-                'years':'2024',
+                'scenario':'CNS_G_RNZ_CB_UC',
+                'year':'2030',
+                'model_type':'dispatch'
             }
         )
     n = pypsa.Network(snakemake.input.network)
 
-    model_file = pd.ExcelFile(snakemake.input.model_file)
-    model_setup = (
-        pd.read_excel(
-            model_file, 
-            sheet_name="model_setup",
-            index_col=[0])
-            .loc[snakemake.wildcards.model_file]
-    )
+    solver_name = snakemake.config["dispatch_solver"]["solver"].pop("name")
+    solver_options = snakemake.config["dispatch_solver"]["solver"].copy()
 
-    config = snakemake.config["electricity"]["dispatch_committable_carriers"]
-    p_max_pu = set_existing_committable(n, model_file, model_setup, config)
-    n.optimize.fix_optimal_capacities()
+    scenario_setup = load_scenario_definition(snakemake)
+    set_optimal_capacities(n)
+    aggregate_coal_unit(n)
 
-    n.optimize.create_model(snapshots = n.snapshots[:2000], linearized_unit_commitment=True, multi_investment_periods=True)
-    set_max_status(n, n.snapshots[:2000], p_max_pu)
-
-    solver_name = snakemake.config["solving"]["solver"].pop("name")
-    solver_options = snakemake.config["solving"]["solver"].copy()
-    n.optimize.solve_model(solver_name=solver_name, solver_options=solver_options)
-
+    extra_func = custom_constraints_wrapper(scenario_setup)
+    #n.optimize(snapshots=n.snapshots[0:500], linearized_unit_commitment=True, extra_functionality=extra_func, solver_name="xpress", solver_options={"lpflags":0,"crossover":0})
+    #n.optimize.optimize_with_rolling_horizon(horizon=48, overlap=24,linearized_unit_commitment=True, extra_functionality=extra_func, solver_name="xpress", solver_options={"threads":20})
+    optimize_with_monthly_rolling_horizon(n, overlap=48, solver_name=solver_name, solver_options=solver_options, scenario_setup = scenario_setup)
     n.export_to_netcdf(snakemake.output[0])
