@@ -20,7 +20,7 @@ scenarios_to_run = scenarios[scenarios["run_scenario"]==1]
 scenarios_dispatch_years={}
 for scenario in scenarios_to_run.index:
     years = scenarios_to_run.loc[scenario,"dispatch_years"]
-    scenarios_dispatch_years[scenario] = re.split(",\s*",years) if isinstance(years, str) else [str(int(years))]
+    scenarios_dispatch_years[scenario] = re.split(r",\s*",years) if isinstance(years, str) else [str(int(years))]
 
 ############################################################################################################
 # Rules to run through all scenarios specified in the scenarios_to_run.xlsx file
@@ -28,7 +28,7 @@ for scenario in scenarios_to_run.index:
 
 rule solve_all:
     input:
-        "results/solve_all_capacity_scenarios"
+        "results/solve_all_capacity_scenarios",
         "results/solve_all_dispatch_scenarios"
 
 rule solve_all_capacity_scenarios:
@@ -74,71 +74,71 @@ rule build_topology:
 ############################################################################################################
 # Rules to produce system dcapacity expansion planning model
 ############################################################################################################
-
-rule base_network_capacity:
-    input:
-        buses="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
-        lines="resources/" + config["scenarios"]["folder"] + "/lines-{scenario}.geojson",
-    output: 
-        "networks/" + config["scenarios"]["folder"] + "/{scenario}/capacity-base.nc",
-    resources: mem_mb=1000
-    script: "scripts/base_network.py"
-
-
-
-rule add_electricity_capacity:
-    input:
-        base_network="networks/" + config["scenarios"]["folder"] + "/{scenario}/capacity-base.nc",
-        supply_regions="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
-        load="data/bundle/SystemEnergy2009_22.csv",
-        eskom_profiles="data/eskom_pu_profiles.csv",
-        renewable_profiles="resources/renewable_profiles_updated.nc",
-    output: "networks/" + config["scenarios"]["folder"] + "/{scenario}/capacity-elec.nc",
-    script: "scripts/add_electricity.py"
+if config["solve_capacity"]:
+    rule base_network_capacity:
+        input:
+            buses="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
+            lines="resources/" + config["scenarios"]["folder"] + "/lines-{scenario}.geojson",
+        output: 
+            "networks/" + config["scenarios"]["folder"] + "/{scenario}/capacity-base.nc",
+        script: "scripts/base_network.py"
 
 
 
-rule prepare_and_solve_network:
-    input:
-        network="networks/"+ config["scenarios"]["folder"] + "/{scenario}/capacity-elec.nc",
-    output: 
-        network="results/" + config["scenarios"]["folder"] + "/{scenario}/capacity-solved.nc",
-        network_stats="results/" + config["scenarios"]["folder"] +"/{scenario}/network_stats_{scenario}.csv",
-        emissions="results/" + config["scenarios"]["folder"] +"/{scenario}/emissions_{scenario}.csv",
-    resources:
-        solver_slots=1
-    script:
-        "scripts/prepare_and_solve_network.py"
+    rule add_electricity_capacity:
+        input:
+            base_network="networks/" + config["scenarios"]["folder"] + "/{scenario}/capacity-base.nc",
+            supply_regions="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
+            load="data/bundle/SystemEnergy2009_22.csv",
+            eskom_profiles="data/eskom_pu_profiles.csv",
+            renewable_profiles="resources/renewable_profiles_updated.nc",
+        output: "networks/" + config["scenarios"]["folder"] + "/{scenario}/capacity-elec.nc",
+        script: "scripts/add_electricity.py"
+
+
+
+    rule prepare_and_solve_network:
+        input:
+            network="networks/"+ config["scenarios"]["folder"] + "/{scenario}/capacity-elec.nc",
+        output: 
+            network="results/" + config["scenarios"]["folder"] + "/{scenario}/capacity-solved.nc",
+            network_stats="results/" + config["scenarios"]["folder"] +"/{scenario}/network_stats_{scenario}.csv",
+            emissions="results/" + config["scenarios"]["folder"] +"/{scenario}/emissions_{scenario}.csv",
+        resources:
+            solver_slots=1
+        script:
+            "scripts/prepare_and_solve_network.py"
 
 
 ############################################################################################################
 # Rules to produce system dispatch model
 ############################################################################################################
-rule base_network_dispatch:
-    input:
-        buses="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
-        lines="resources/" + config["scenarios"]["folder"] + "/lines-{scenario}.geojson",
-    output: 
-        "networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-base.nc",
-    resources: mem_mb=1000
-    script: "scripts/base_network.py"
+if config["solve_dispatch"]:
+    rule base_network_dispatch:
+        input:
+            buses="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
+            lines="resources/" + config["scenarios"]["folder"] + "/lines-{scenario}.geojson",
+        output: 
+            "networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-base.nc",
+        resources: mem_mb=1000
+        script: "scripts/base_network.py"
 
-rule add_electricity_dispatch:
-    input:
-        base_network="networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-base.nc",
-        supply_regions="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
-        load="data/bundle/SystemEnergy2009_22.csv",
-        eskom_profiles="data/eskom_pu_profiles.csv",
-        renewable_profiles="resources/renewable_profiles_updated.nc",
-    output: "networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-elec.nc",
-    script: "scripts/add_electricity.py"
+    rule add_electricity_dispatch:
+        input:
+            base_network="networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-base.nc",
+            supply_regions="resources/" + config["scenarios"]["folder"] + "/buses-{scenario}.geojson",
+            load="data/bundle/SystemEnergy2009_22.csv",
+            eskom_profiles="data/eskom_pu_profiles.csv",
+            renewable_profiles="resources/renewable_profiles_updated.nc",
+        output: "networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-elec.nc",
+        script: "scripts/add_electricity.py"
 
-rule solve_network_dispatch:
-    input:
-        network="networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-elec.nc",
-        optimised_network_stats="results/" + config["scenarios"]["folder"] +"/{scenario}/network_stats_{scenario}.csv",
-    output: "results/" + config["scenarios"]["folder"]+"/{scenario}/dispatch-{year}-solved.nc",
-    resources:
-        solver_slots=1
-    script:
-        "scripts/solve_network_dispatch.py"
+    rule solve_network_dispatch:
+        input:
+            network="networks/" + config["scenarios"]["folder"] + "/{scenario}/dispatch-{year}-elec.nc",
+            optimised_network_stats="results/" + config["scenarios"]["folder"] +"/{scenario}/network_stats_{scenario}.csv",
+        output: "results/" + config["scenarios"]["folder"]+"/{scenario}/dispatch-{year}-solved.nc",
+        resources:
+            solver_slots=1
+        script:
+            "scripts/solve_network_dispatch.py"

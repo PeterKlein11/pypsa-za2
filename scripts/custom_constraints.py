@@ -165,10 +165,10 @@ def set_operational_limits(n, sns, scenario_setup, snakemake, exclude_flag=[], m
         index_col=list(range(9)),
     )
 
-    if scenario_setup["operational_limits"] not in op_limits.index.get_level_values(0).unique():
-        logging.warning(f"Operational limits for scenario {scenario_setup['operational_limits']} not found, skipping.")
+    if scenario_setup[model_type+"_operational_limits"] not in op_limits.index.get_level_values(0).unique():
+        logging.warning(f"Operational limits for scenario {scenario_setup[model_type+'_operational_limits']} not found, skipping.")
         return
-    op_limits = op_limits.loc[scenario_setup["operational_limits"]]
+    op_limits = op_limits.loc[scenario_setup[model_type+"_operational_limits"]]
 
     if len(exclude_flag) > 0:
         logging.warning(f"Excluding operational limits that are specified in {exclude_flag}.")

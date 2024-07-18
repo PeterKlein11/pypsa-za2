@@ -534,7 +534,6 @@ def get_aggregation_strategies(aggregation_strategies):
 
     return bus_strategies, generator_strategies
 
-
 def mock_snakemake(rulename, **wildcards):
     """
     This function is expected to be executed from the "scripts"-directory of "
@@ -552,20 +551,30 @@ def mock_snakemake(rulename, **wildcards):
         needed.
     """
     import os
+
     import snakemake as sm
     from pypsa.descriptors import Dict
     from snakemake.script import Snakemake
+    from snakemake.common import SNAKEFILE_CHOICES
+    from snakemake.api import Workflow
+    from snakemake.settings.types import (
+        ConfigSettings,
+        DAGSettings,
+        ResourceSettings,
+        StorageSettings,
+        WorkflowSettings,
+    )
 
     script_dir = Path(__file__).parent.resolve()
     assert (
         Path.cwd().resolve() == script_dir
     ), f"mock_snakemake has to be run from the repository scripts directory {script_dir}"
     os.chdir(script_dir.parent)
-    for p in sm.SNAKEFILE_CHOICES:
+    for p in SNAKEFILE_CHOICES:
         if os.path.exists(p):
             snakefile = p
             break
-    workflow = sm.Workflow(snakefile, overwrite_configfiles=[], rerun_triggers=[])
+    workflow = Workflow(ConfigSettings(configfiles=[]), ResourceSettings(), WorkflowSettings(), StorageSettings(), DAGSettings(rerun_triggers=[]), storage_provider_settings=dict())
     workflow.include(snakefile)
     workflow.global_resources = {}
     try:
@@ -605,6 +614,77 @@ def mock_snakemake(rulename, **wildcards):
 
     os.chdir(script_dir)
     return snakemake
+
+# def mock_snakemake(rulename, **wildcards):
+#     """
+#     This function is expected to be executed from the "scripts"-directory of "
+#     the snakemake project. It returns a snakemake.script.Snakemake object,
+#     based on the Snakefile.
+
+#     If a rule has wildcards, you have to specify them in **wildcards.
+
+#     Parameters
+#     ----------
+#     rulename: str
+#         name of the rule for which the snakemake object should be generated
+#     **wildcards:
+#         keyword arguments fixing the wildcards. Only necessary if wildcards are
+#         needed.
+#     """
+#     import os
+#     import snakemake as sm
+#     from pypsa.descriptors import Dict
+#     from snakemake.script import Snakemake
+
+#     script_dir = Path(__file__).parent.resolve()
+#     assert (
+#         Path.cwd().resolve() == script_dir
+#     ), f"mock_snakemake has to be run from the repository scripts directory {script_dir}"
+#     os.chdir(script_dir.parent)
+#     for p in sm.SNAKEFILE_CHOICES:
+#         if os.path.exists(p):
+#             snakefile = p
+#             break
+#     workflow = sm.Workflow(snakefile, overwrite_configfiles=[], rerun_triggers=[])
+#     workflow.include(snakefile)
+#     workflow.global_resources = {}
+#     try:
+#         rule = workflow.get_rule(rulename)
+#     except Exception as exception:
+#         print(
+#             exception,
+#             f"The {rulename} might be a conditional rule in the Snakefile.\n"
+#             f"Did you enable {rulename} in the config?",
+#         )
+#         raise
+#     dag = sm.dag.DAG(workflow, rules=[rule])
+#     wc = Dict(wildcards)
+#     job = sm.jobs.Job(rule, dag, wc)
+
+#     def make_accessable(*ios):
+#         for io in ios:
+#             for i in range(len(io)):
+#                 io[i] = os.path.abspath(io[i])
+
+#     make_accessable(job.input, job.output, job.log)
+#     snakemake = Snakemake(
+#         job.input,
+#         job.output,
+#         job.params,
+#         job.wildcards,
+#         job.threads,
+#         job.resources,
+#         job.log,
+#         job.dag.workflow.config,
+#         job.rule.name,
+#         None,
+#     )
+#     # create log and output dir if not existent
+#     for path in list(snakemake.log) + list(snakemake.output):
+#         Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+#     os.chdir(script_dir)
+#     return snakemake
 
 
 
@@ -765,7 +845,8 @@ def get_investment_periods(sns, multi_invest):
 
 def adjust_by_p_max_pu(n, config):
     for carrier in config.keys():
-        gen_list = n.generators.query("carrier == @carrier and not committable").index # only adjust ramp rates for non-committable generators
+        #gen_list = n.generators.query("carrier == @carrier and not committable").index # only adjust ramp rates for non-committable generators
+        gen_list = n.generators.query("carrier == @carrier").index
         for p in config[carrier]:
             n.generators_t[p][gen_list] = (
                 get_as_dense(n, "Generator", p)[gen_list] * get_as_dense(n, "Generator", "p_max_pu")[gen_list]
@@ -835,7 +916,7 @@ def apply_default_attr(df, attrs, snakemake):
 
     default_list = default_list[default_list.isin(df.columns)]
 
-    conv_type = {'int': int, 'float': float, "static or series": float, "series": float, 'boolean': bool}
+    conv_type = {'int': int, 'float': float, "static or series": float, "series": float, 'boolean': bool, 'string': str}
     for attr in default_list:
         default = default_attrs.loc[attr, "default"]
         df[attr] = df[attr].fillna(conv_type[default_attrs.loc[attr, "type"]](default))

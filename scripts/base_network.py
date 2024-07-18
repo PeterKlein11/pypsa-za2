@@ -164,8 +164,8 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             "base_network_dispatch", 
             **{
-                "scenario":"CNS_G_RNZ_CB_UC",
-                "year":2030,
+                "scenario":"CNS_G_RNZ_CB",
+                "year":2050,
             }
         )
     MODEL_TYPE = snakemake.output[0].split(f"{snakemake.wildcards.scenario}/")[1].split("-")[0]

@@ -1,4 +1,4 @@
-name: pypsa-rsa
+name: pypsa-eur
 channels:
 - conda-forge
 - bioconda

@@ -19,6 +19,9 @@ scenarios:
   folder: ME IRP 2024
   setup: "scenarios_to_run.xlsx"
 
+solve_capacity: False
+solve_dispatch: True
+
 gis:
   path: "/media/pklein/Dropbox SSD/Meridian Dropbox/ME Projects/03 R E S O U R C E S/Modelling data/GIS data"
   # definition of the Coordinate Reference Systems
@@ -118,8 +121,8 @@ electricity:
       build_phase_in: overnight
 
   adjust_by_p_max_pu: #adjusts ramp limit and p_min_pu by outages representated by p_max_pu
-    coal: [ramp_limit_up, ramp_limit_down]
-    nuclear: [ramp_limit_up, ramp_limit_down] # leave empty to ignore #can add p_min_pu here as well
+    coal: [ramp_limit_up, ramp_limit_down, ramp_limit_start_up, ramp_limit_shut_down]
+    nuclear: [ramp_limit_up, ramp_limit_down] 
   
   clean_pu_profiles: true # if true, if p_max_pu is less than p_min_pu in any hour it is set to p_min_pu
 
@@ -192,6 +195,8 @@ capacity_solver:
 
 dispatch_solver:
   solver:
-    name: cbc
-  options:
+    name: xpress
+    lpflags: 4
+    crossover: 0
+    bargapstop: 1.e-6
 

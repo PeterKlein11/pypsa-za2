@@ -104,7 +104,7 @@ from shapely.geometry import Point
 import xarray as xr
 import warnings
 warnings.simplefilter(action="ignore") # Comment out for debugging and development
-
+import re
 
 from _helpers import (
     add_missing_carriers,
@@ -370,13 +370,15 @@ def extend_reference_data(n, ref_data, snapshots):
 
     #for _ in range(int(np.ceil(len(ext_years) / len(ref_years)))-1):
     #    ref_data = pd.concat([ref_data, ref_data],axis=0)
-
-    num_repeats = int(np.ceil(len(ext_years) / len(ref_years)))
-    ref_data_replicated = pd.concat([ref_data] * num_repeats, axis=0).reset_index(drop=True)
-    ref_data_replicated = ref_data_replicated.iloc[:len(ext_years)*8760]
-
-    extended_data.iloc[:] = ref_data_replicated.iloc[range(len(extended_data))].values
-
+    if MODEL_TYPE == "capacity":
+        num_repeats = int(np.ceil(len(ext_years) / len(ref_years)))
+        ref_data_replicated = pd.concat([ref_data] * num_repeats, axis=0).reset_index(drop=True)
+        ref_data_replicated = ref_data_replicated.iloc[:len(ext_years)*8760]
+        extended_data.iloc[:] = ref_data_replicated.iloc[range(len(extended_data))].values
+    else:
+        dispatch_years = list(map(int, re.split(",\s*", scenario_setup["dispatch_years"])))
+        weather_years = pd.Series(list(map(int, re.split(",\s*", scenario_setup["dispatch_weather_ref"]))), index = dispatch_years)
+        extended_data.iloc[:] = ref_data.loc[str(weather_years.loc[int(snakemake.wildcards.year)])].values
     return extended_data.clip(lower=0., upper=1.)
 
 
@@ -758,14 +760,6 @@ def attach_fixed_generators(n, carriers):
     for gen in split_gens:
         station = gen.split("*")[0]
         pu_profiles.loc["max", gen] = conv_pu[station].values
-
-    # eskom_carriers = [carrier for carrier in conv_carriers if carrier not in ["nuclear", "hydro", "hydro_import"]]
-    # for col in gens.query("Grouping == 'eskom' & carrier in @eskom_carriers").index:
-    #     pu_profiles.loc["max", col] = conv_pu[col.split("*")[0]].values
-
-
-    #rmippp_constraints(n, n.snapshots)
-
     # Hourly data from Eskom data portal
     eskom_re_pu = generate_eskom_re_profiles(n, re_carriers)
     eskom_re_carriers = eskom_re_pu.columns
@@ -803,8 +797,11 @@ def attach_fixed_generators(n, carriers):
         # If building dispatch model, only assign p_min_pu to non unit committment generators
         non_uc_gens = n.generators[~n.generators.committable].index
         n.generators_t.p_min_pu[non_uc_gens] = pu_min[non_uc_gens].clip(lower=0.0, upper=1.0)
-    #for carrier, value in snakemake.config["electricity"]["min_hourly_station_gen"]["fixed"].items():
-    #    clip_pu_profiles(n, "p_min_pu", n.generators.query("carrier == @carrier & p_nom_extendable == False").index, lower=value, upper=1.0)
+    
+    # Set up time before up for committable generators to avoid ramping issues in first snapshot
+    com_i = n.generators.query("committable").index
+    n.generators.up_time_before[com_i] = n.generators.min_up_time[com_i]
+
 
 def define_extendable_tech(carriers, years, type_, ext_param):
 
@@ -895,9 +892,6 @@ def attach_extendable_generators(n, carriers):
     if MODEL_TYPE == "capacity": #p_min_pu is min stable level fo dispatch model, so only set p_mn_pu her for capacity model
         n.generators_t.p_min_pu.loc[:, in_network] = pu_min.loc[:, in_network].clip(lower=0.0, upper=1.0)
 
-    #for carrier, value in snakemake.config["electricity"]["min_hourly_station_gen"]["fixed"].items():
-    #    clip_pu_profiles(n, "p_min_pu", n.generators.query("carrier == @carrier & p_nom_extendable").index, lower=value, upper=1.0)
-
 
 def set_annual_build_limits(techs, ext_years, component):
     
@@ -984,7 +978,7 @@ def set_extendable_params(c, bus_carrier_years, ext_param, **config):
     elif c == "StorageUnit":
         for param in default_col:
             component_df[param] =  component_df.apply(lambda row: ext_param.loc[(param, row["carrier"]), row["build_year"]], axis=1)
-        
+        component_df["p_min_pu"] = -1
         component_df["cyclic_state_of_charge"] = True
         component_df["cyclic_state_of_charge_per_period"] = True
         component_df["efficiency_store"] = component_df["efficiency"]**0.5
@@ -1102,10 +1096,13 @@ def attach_extendable_storage(n, carriers):
     ext_param = load_extendable_parameters(n, scenario_setup, snakemake)
     ext_storage_list = define_extendable_tech(carriers, ext_years, "StorageUnit", ext_param)
     storage = set_extendable_params("StorageUnit", ext_storage_list, ext_param, **config)
+    storage = drop_non_pypsa_attrs(n, "StorageUnit", storage)
+    
     if MODEL_TYPE == "capacity":
         storage = set_annual_build_limits(storage, ext_years, "StorageUnit")
+    else:
+        storage["p_nom_extendable"] = False
     if len(ext_storage_list):
-        storage = drop_non_pypsa_attrs(n, "StorageUnit", storage)
         n.import_components_from_dataframe(storage, "StorageUnit")
 
 
@@ -1234,10 +1231,11 @@ if __name__ == "__main__":
     logging.info("Attaching extendable storage")
     attach_extendable_storage(n, carriers)
 
+    adj_by_pu = snakemake.config["electricity"]["adjust_by_p_max_pu"]
+    logging.info(f"Adjusting by p_max_pu for {list(adj_by_pu.keys())}")
+    adjust_by_p_max_pu(n, adj_by_pu)
+    
     if MODEL_TYPE == "capacity":
-        adj_by_pu = snakemake.config["electricity"]["adjust_by_p_max_pu"]
-        logging.info(f"Adjusting by p_max_pu for {list(adj_by_pu.keys())}")
-        adjust_by_p_max_pu(n, adj_by_pu)
 
         logging.info("Adjusting for changes in fuel price over time")
         adjust_for_variable_fuel_costs(n)
@@ -1255,7 +1253,6 @@ if __name__ == "__main__":
         adjust_com_msl(n)
 
 
-
     if snakemake.config["costs"]["load_shedding"]:
         ls_cost = snakemake.config["costs"]["COUE"]
         logging.info("Adding load shedding")
@@ -1263,9 +1260,8 @@ if __name__ == "__main__":
 
     add_missing_carriers(n)
 
-    logging.info("Exporting network.")
     if n.multi_invest:
         initial_ramp_rate_fix(n)
-
+    logging.info("Exporting network.")
     n.export_to_netcdf(snakemake.output[0])
 

@@ -58,7 +58,6 @@ import re
 import numpy as np
 import pandas as pd
 import pypsa
-from pypsa.linopt import get_var, write_objective, define_constraints, linexpr
 from pypsa.descriptors import get_switchable_as_dense as get_as_dense, expand_series
 from pypsa.optimization.common import reindex
 
@@ -164,31 +163,6 @@ def add_emission_prices(n, emission_prices=None, exclude_co2=False):
     ep = (pd.Series(emission_prices).rename(lambda x: x+"_emissions") * n.carriers).sum(axis=1)
     n.generators["marginal_cost"] += n.generators.carrier.map(ep)
     n.storage_units["marginal_cost"] += n.storage_units.carrier.map(ep)
-
-"""
-********************************************************************************
-    Linear unit commitment constraints
-********************************************************************************
-"""
-def set_max_status(n, sns):
-
-    status_idx = n.generators.query("committable == True").index
-    status_max = n.get_switchable_as_dense("Generator", "p_max_pu")[status_idx].copy()
-    n.generators_t.p_max_pu[status_idx] = 1
-
-    # remove time varying p_min_pu for committable
-    remove_list = [sm for sm in status_max.columns if sm in n.generators_t.p_min_pu.columns]
-    n.generators_t.p_min_pu.drop(remove_list, axis=1, inplace=True) 
-    n.generators.up_time_before = n.generators.min_up_time
-
-    status = n.model.variables["Generator-status"].sel({"Generator-com":status_max.columns})
-    lhs = status.sel(snapshot=sns)
-    if status_max.columns.name != "Generator-com":
-        status_max.columns.name = "Generator-com"
-    rhs = xr.DataArray(status_max.loc[sns])   
-    n.model.add_constraints(lhs, "<=", rhs, name="max_status")
-    
-    return status_max
 
 """
 ********************************************************************************
@@ -357,7 +331,7 @@ if __name__ == "__main__":
         snakemake = mock_snakemake(
             'prepare_and_solve_network', 
             **{
-                'scenario':'CNS_G_RNZ_CB_UC',
+                'scenario':'CNS_G_RNZ_CB',
             }
         )
     logging.basicConfig(
